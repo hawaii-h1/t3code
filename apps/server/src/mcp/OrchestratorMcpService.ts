@@ -67,6 +67,7 @@ import {
 import { getProviderOptionCurrentValue } from "@t3tools/shared/model";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
+import { remainingPercent } from "@t3tools/shared/usageLimits";
 import {
   normalizeThreadPullRequestKey,
   visibleThreadPullRequests,
@@ -358,6 +359,24 @@ function providerConstraints(
     constraints.push("Provider is not authenticated.");
   }
   return constraints;
+}
+
+/**
+ * A used-up window may cover only some models (Cursor pools, Claude's Fable
+ * weekly), so it steers and warns but never blocks delegation.
+ */
+function usedUpWindow(provider: ServerProvider | undefined, now: number) {
+  return provider?.usageLimits?.windows.find(
+    (window) =>
+      window.usedPercent >= 100 &&
+      (window.resetsAt === undefined || Date.parse(window.resetsAt) > now),
+  );
+}
+
+function usageWarning(provider: ServerProvider | undefined, now: number) {
+  const window = usedUpWindow(provider, now);
+  if (provider === undefined || window === undefined) return undefined;
+  return `${provider.instanceId} has used up its ${window.label} limit${window.resetsAt === undefined ? "" : ` until ${window.resetsAt}`}. The child may stop until it resets. If that does not fit, task_cancel it and pick a provider with usage left.`;
 }
 
 /** Skip checks without descriptors; reject duplicate IDs because consumers disagree on precedence. */
@@ -1275,10 +1294,15 @@ const make = Effect.gen(function* () {
       const inheritedCandidate = healthyCandidates.find(
         (candidate) => candidate.instanceId === input.parent.thread.modelSelection.instanceId,
       );
+      const now = yield* Clock.currentTimeMillis;
       const orderedCandidates = [
         ...(inheritedCandidate === undefined ? [] : [inheritedCandidate]),
         ...healthyCandidates.filter((candidate) => candidate !== inheritedCandidate),
-      ];
+      ].toSorted(
+        (left, right) =>
+          Number(usedUpWindow(left, now) !== undefined) -
+          Number(usedUpWindow(right, now) !== undefined),
+      );
       for (const candidate of orderedCandidates) {
         const enabledForProject =
           input.skipProjectEnablementFilter === true ||
@@ -2155,6 +2179,18 @@ const make = Effect.gen(function* () {
             provider.supportedRuntimeModes.length === 0
               ? {}
               : { runtimeModes: [...provider.supportedRuntimeModes] }),
+            ...(provider.usageLimits === undefined || provider.usageLimits.windows.length === 0
+              ? {}
+              : {
+                  usage: {
+                    checkedAt: provider.usageLimits.checkedAt,
+                    windows: provider.usageLimits.windows.map((window) => ({
+                      label: window.label,
+                      leftPercent: remainingPercent(window),
+                      ...(window.resetsAt === undefined ? {} : { resetsAt: window.resetsAt }),
+                    })),
+                  },
+                }),
             canRunChildTask: constraints.length === 0,
             canRunCrossProviderChildTask: constraints.length === 0,
             constraints: [...constraints],
@@ -2325,8 +2361,14 @@ const make = Effect.gen(function* () {
         });
       }
 
+      const warning = usageWarning(
+        providers.find((provider) => provider.instanceId === target.modelSelection.instanceId),
+        yield* Clock.currentTimeMillis,
+      );
+      const withWarning = (task: OrchestratorMcpDelegateTaskResult) =>
+        warning === undefined ? task : { ...task, usageWarning: warning };
       if (input.mode !== "wait") {
-        return yield* readTask(scope, taskId, false, true);
+        return withWarning(yield* readTask(scope, taskId, false, true));
       }
       const timeoutMs = Math.min(
         MAX_WAIT_TIMEOUT_MS,
@@ -2334,7 +2376,7 @@ const make = Effect.gen(function* () {
       );
       const waited = yield* waitForTask(scope, taskId, timeoutMs);
       if (Option.isSome(waited) && isTerminalTaskStatus(waited.value.status)) {
-        return waited.value;
+        return withWarning(waited.value);
       }
       // An incomplete wait gives up delivery: upgrade so a later terminal
       // wakes the parent even mid-turn.
@@ -2369,7 +2411,7 @@ const make = Effect.gen(function* () {
             }),
           ),
         );
-      return yield* readTask(scope, taskId, Option.isNone(waited), true);
+      return withWarning(yield* readTask(scope, taskId, Option.isNone(waited), true));
     }),
     taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (callerScope, taskId) {
       const scope = yield* requireThreadScope(callerScope, "task_status");

@@ -201,7 +201,8 @@ Returns:
 - the inherited provider instance and model;
 - the parent runtime and interaction modes;
 - registered provider instances and advertised models;
-- whether each provider can run a child task; and
+- whether each provider can run a child task;
+- each provider's subscription usage left, when it reports limits; and
 - feature flags for polling, cancellation, and batch thread creation.
 
 Unavailable providers include model-visible constraints such as missing V2
@@ -244,6 +245,12 @@ when it can run child tasks, and otherwise selects an available instance of
 that driver; an explicit `providerInstanceId` is honored exactly and fails
 when unavailable. Selecting a different provider without a model uses that
 provider's first advertised model.
+
+A used-up usage window only steers and warns. A driver-only target prefers an
+instance with usage left, and a child started on a provider with a used-up
+window returns `usageWarning`. Delegation is not refused, because a window can
+cover only some models (Cursor's pools, Claude's per-model weekly limit) and
+readings can lag behind a reset.
 
 A provider runs a runtime mode it does not offer as `approval-required`, so a
 child would ask for approval on every command. `orchestrator_capabilities`
